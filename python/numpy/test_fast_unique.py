@@ -2,7 +2,7 @@ import unittest
 
 import numpy as np
 
-from utils import np_unique_int_fast
+from fast_unique import np_unique_int_fast
 
 
 class TestNpUniqueIntFast(unittest.TestCase):
