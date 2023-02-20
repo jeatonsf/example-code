@@ -88,7 +88,7 @@ class FeedForward(torch.nn.Module):
         return self.sequential(x)
 
 
-class BigramLanguageModel(torch.nn.Module):
+class NanoGPT(torch.nn.Module):
     def __init__(self, n_token: int, n_embed: int, block_size: int, n_heads: int, n_layer: int, dropout: float, device: str) -> None:
         super().__init__()
         self.device = device
@@ -185,7 +185,7 @@ class Foo():
         val_data = data[n:]
 
         # model
-        self.model = BigramLanguageModel(
+        self.model = NanoGPT(
             len(tokenizer),
             self.n_embed,
             self.block_size,

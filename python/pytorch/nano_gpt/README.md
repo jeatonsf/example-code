@@ -62,7 +62,7 @@ I take othu that shot our yoe'd from in fancy-
 Exours, him, he formured gen
 ```
 
-Final 10k character output
+5k train steps. 10k character output
 ```
 TOKBOUKE MANTIO:
 Forforth it.
