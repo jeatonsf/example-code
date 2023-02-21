@@ -3,9 +3,9 @@
 Nano GPT is a model built by Andrej Karpathy to teach transformers and Chat GPT. It is a character model (predicts the next character) trained on all of Shakespeare.
 
 YouTube tutorial: [https://www.youtube.com/watch?v=kCc8FmEb1nY](https://www.youtube.com/watch?v=kCc8FmEb1nY)
-## Run
-To train a model run
 
+[![Let's build GPT: from scratch, in code, spelled out.](https://img.youtube.com/vi/kCc8FmEb1nY/0.jpg)](https://www.youtube.com/watch?v=kCc8FmEb1nY)
+## Run
 ```
 python train.py
 ```
@@ -17,6 +17,10 @@ Use pip to install the following packages.
 pip install pytorch
 pip install smart-open
 ```
+
+## FYI
+
+One major difference exist between Andrej Karpathy's implementation of a Transformer encoder and `torch.nn.TransformerEncoderLayer`. Karpathy applies `torch.nn.LayerNorm` before Multi-head attention and again before feed-forward. This is common for more recent architectures and does lead to a significant increase in performance.
 
 ## Results
 

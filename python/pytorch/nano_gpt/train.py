@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Iterator, Optional, Sequence, Sized, Tuple, Union
 
 import torch
 from smart_open import open
@@ -8,8 +8,74 @@ from smart_open import open
 def main():
     with open("https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt", "r", encoding="utf-8") as f:
         text = f.read()
-    foo = Foo()
-    foo.train(text)
+
+    # data and split
+    block_size = 64
+    tokenizer = Tokenizer(text)
+    data = tokenizer.encode(text)
+    n = int(0.9 * len(data))
+    dataloaders = []
+    for data in (data[:n], data[n:]):
+        dataset = TokenDataset(data, block_size=block_size)
+        sampler = InfiniteRandomBatchSampler(dataset, batch_size=64)
+        dataloaders.append(torch.utils.data.DataLoader(dataset, batch_sampler=sampler))
+
+    # model and train
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = NanoGPT(
+        tokenizer=tokenizer,
+        n_embed=128,
+        block_size=block_size,
+        n_heads=4,  # Each head is 128 / 4 = 64 dimensional
+        n_layer=3,
+        dropout=0.2,
+        device=device,
+    ).to(device)
+    trainer = Trainer(
+        model=model,
+        max_step=5000,
+        eval_steps=200,
+        lr=3e-4,
+        n_eval_batches=200,
+        device=device,
+    )
+    trainer.train(*dataloaders)
+    """Tutorial parameters (Model to large to train on personal cpu)
+    block_size: int = 256
+    model = NanoGPT(
+        tokenizer=tokenizer,
+        n_embed=384,
+        block_size=block_size,
+        n_heads=6,  # Each head is 384 / 6 = 64 dimensional
+        n_layer=6,
+        dropout=0.2,
+        device=device,
+    ).to(device)
+    trainer = Trainer(
+        model=model,
+        max_step=5000,
+        eval_steps=200,
+        lr=3e-4,
+        n_eval_batches=200,
+        device=device,
+    )
+    """
+
+
+class Tokenizer():
+    def __init__(self, text: str) -> None:
+        chars = sorted(list(set(text)))
+        self.c2i = {c: i for i, c in enumerate(chars)}
+        self.i2c = {i: c for i, c in enumerate(chars)}
+
+    def __len__(self) -> int:
+        return len(self.c2i)
+
+    def encode(self, text: str) -> List[int]:
+        return torch.tensor([self.c2i[c] for c in text], dtype=torch.long)
+
+    def decode(self, tokens: torch.Tensor) -> str:
+        return "".join([self.i2c[int(token)] for token in torch.flatten(tokens)])
 
 
 class Block(torch.nn.Module):
@@ -60,6 +126,7 @@ class Head(torch.nn.Module):
         Returns:
             out (shape: (batch_size, block_size, n_embed))
         """
+        B, T, C = x.shape
         q = self.query(x)  # (B, T, H)
         k = self.key(x)  # (B, T, H)
         v = self.value(x)
@@ -67,7 +134,7 @@ class Head(torch.nn.Module):
         Shapes are (B, T, H) @ (B, H, T) -> (B, T, T)
         """
         weight = q @ k.transpose(-2, -1) * self.head_size ** -0.5
-        weight = weight.masked_fill(self.tril[:self.block_size, :self.block_size] == 0, float("-inf"))
+        weight = weight.masked_fill(self.tril[:T, :T] == 0, float("-inf"))
         weight = torch.nn.functional.softmax(weight, dim=-1)  # Trick that makes -inf -> zero. Normalize rest
         weight = self.dropout(weight)
         out = weight @ v  # (B, T, T) @ (B, T, H) -> (B, T, H)
@@ -89,15 +156,19 @@ class FeedForward(torch.nn.Module):
 
 
 class NanoGPT(torch.nn.Module):
-    def __init__(self, n_token: int, n_embed: int, block_size: int, n_heads: int, n_layer: int, dropout: float, device: str) -> None:
+    def __init__(self, tokenizer: int, n_embed: int, block_size: int, n_heads: int, n_layer: int, dropout: float, device: str) -> None:
         super().__init__()
+        self.tokenizer = tokenizer
         self.device = device
         self.block_size = block_size
+        n_token = len(self.tokenizer)
         self.tok_embed = torch.nn.Embedding(n_token, n_embed)  # (n_token, n_embed) transition matrix
         self.pos_embed = torch.nn.Embedding(block_size, n_embed)  # (block_size, n_embed) transition matrix
         self.blocks = torch.nn.Sequential(
             *[Block(n_heads=n_heads, n_embed=n_embed, block_size=block_size, dropout=dropout) for _ in range(n_layer)],
         )
+        # Use the following for default pytorch. Note performance is worse
+        # self.blocks = torch.nn.TransformerEncoder(torch.nn.TransformerEncoderLayer(d_model=n_embed, nhead=n_heads, dim_feedforward=n_embed * 4, dropout=dropout), num_layers=n_layer)
         self.ln_f = torch.nn.LayerNorm(n_embed)
         self.lm_head = torch.nn.Linear(n_embed, n_token)  # language model head. from embedding space back to tokens
 
@@ -127,7 +198,6 @@ class NanoGPT(torch.nn.Module):
         logits = self.lm_head(x)  # (batch_size, block_size, n_token)
         if targets is None:
             return logits, None
-
         # cross_entropy expects shape (examples, channels). Move batch & block to single axis
         B, T, C = logits.shape  # batch, time, channel
         loss = torch.nn.functional.cross_entropy(logits.view(-1, C), targets.view(-1))
@@ -149,109 +219,87 @@ class NanoGPT(torch.nn.Module):
             tokens = torch.cat((tokens, token_next), dim=1)
         return tokens
 
+    def generate_from_text(self, text: str = " ", k: int = 8) -> str:
+        tokens = self.tokenizer.encode(text).reshape((1, -1))
+        tokens = self.generate(tokens, k)
+        return self.tokenizer.decode(tokens)
+
+
+class TokenDataset(torch.utils.data.Dataset):
+    def __init__(self, tokens: torch.Tensor, block_size: int) -> None:
+        super().__init__()
+        self.tokens = tokens
+        self.block_size = block_size
+
+    def __len__(self) -> int:
+        return len(self.tokens) - self.block_size - 1
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        return (
+            self.tokens[idx:idx + self.block_size],
+            self.tokens[idx + 1:idx + self.block_size + 1]
+        )
+
+
+class InfiniteRandomBatchSampler(torch.utils.data.RandomSampler):
+    def __init__(self, data_source: Sized, batch_size: int) -> None:
+        super().__init__(data_source, replacement=True)
+        self.batch_size = batch_size
+
+    def __iter__(self) -> Iterator[int]:
+        batch = []
+        while True:
+            for idx in super().__iter__():
+                if len(batch) == self.batch_size:
+                    yield batch
+                    batch = []
+                batch.append(idx)
+
 
 @dataclass
-class Foo():
-    batch_size: int = 64
-    block_size: int = 64
-    n_embed: int = 128
-    n_heads: int = 4  # Each head is 128 / 4 = 64 dimensional
-    n_layer: int = 3
-    dropout: float = 0.2
-    max_step: int = 5000
-    eval_steps: int = 200
-    lr: float = 3e-4
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    n_eval_batches: int = 200
+class Trainer():
+    model: torch.nn.Module
+    max_step: int
+    eval_steps: int
+    lr: float
+    n_eval_batches: int
+    device: str
 
-    # batch_size: int = 64
-    # block_size: int = 256
-    # n_embed: int = 384
-    # n_heads: int = 6  # Each head is 384 / 6 = 64 dimensional
-    # n_layer: int = 6
-    # dropout: float = 0.2
-    # max_step: int = 5000
-    # eval_steps: int = 200
-    # lr: float = 3e-4
-    # device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    # n_eval_batches: int = 200
-
-    def train(self, text: str) -> None:
-        # data
-        tokenizer = Tokenizer(text)
-        data = torch.tensor(tokenizer.encode(text), dtype=torch.long)
-        n = int(0.9 * len(data))
-        train_data = data[:n]
-        val_data = data[n:]
-
-        # model
-        self.model = NanoGPT(
-            len(tokenizer),
-            self.n_embed,
-            self.block_size,
-            self.n_heads,
-            self.n_layer,
-            self.dropout,
-            device=self.device
-        ).to(self.device)
-
-        # train
+    def train(
+        self,
+        train_dataloader: torch.utils.data.DataLoader,
+        val_dataloader: torch.utils.data.DataLoader
+    ) -> None:
         optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.lr)
         for step in range(self.max_step):
             if step % self.eval_steps == 0:
-                train_loss, val_loss = self.estimate_loss(train_data, val_data)
-                print(f"step {step}: train_loss {train_loss:.4f}, val_loss {val_loss:.4f}")
-
-                tokens = torch.zeros((1, self.block_size), dtype=torch.long).to(self.device)
-                out = self.model.generate(tokens, 100)
-                print(tokenizer.decode(out[0].tolist()))
-            xb, yb = self.get_batch(train_data)
+                self.print_progress(step, train_dataloader, val_dataloader, 100)
+            xb, yb = next(iter(train_dataloader))
             logits, loss = self.model(xb.to(self.device), yb.to(self.device))
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
-        print(loss.item())
+        self.print_progress(step, train_dataloader, val_dataloader, 1000)
 
-        tokens = torch.zeros((1, self.block_size), dtype=torch.long).to(self.device)
-        out = self.model.generate(tokens, 10000)
-        print(tokenizer.decode(out[0].tolist()))
-
-
-    def get_batch(self, data: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        idx = torch.randint(len(data) - self.block_size, (self.batch_size,))
-        x = torch.stack([data[i:i + self.block_size] for i in idx])
-        y = torch.stack([data[i + 1:i + self.block_size + 1] for i in idx])
-        return x, y
+    def print_progress(self, step, train_dataloader, val_dataloader, k: int) -> None:
+        train_loss, val_loss = self.estimate_loss(train_dataloader, val_dataloader)
+        print(f"step {step}: train_loss {train_loss:.4f}, val_loss {val_loss:.4f}")
+        print(self.model.generate_from_text(" ", k))
 
     @torch.no_grad()
-    def estimate_loss(self, train_data: torch.Tensor, val_data: torch.tensor) -> Tuple[float, float]:
+    def estimate_loss(self, train_dataloader: torch.utils.data.DataLoader, val_dataloader: torch.utils.data.DataLoader) -> Tuple[float, float]:
         out = []
         self.model.eval()
-        for data in [train_data, val_data]:
+        for dataloader in [train_dataloader, val_dataloader]:
+            iter_dataloader = iter(dataloader)
             losses = torch.zeros(self.n_eval_batches)
             for k in range(self.n_eval_batches):
-                x, y = self.get_batch(data)
+                x, y = next(iter_dataloader)
                 _, loss = self.model(x, y)
                 losses[k] = loss.item()
             out.append(losses.mean())
         self.model.train()
         return tuple(out)
-
-
-class Tokenizer():
-    def __init__(self, text: str) -> None:
-        chars = sorted(list(set(text)))
-        self.c2i = {c: i for i, c in enumerate(chars)}
-        self.i2c = {i: c for i, c in enumerate(chars)}
-
-    def __len__(self) -> int:
-        return len(self.c2i)
-
-    def encode(self, text: str) -> List[int]:
-        return [self.c2i[c] for c in text]
-
-    def decode(self, tokens: List[int]) -> str:
-        return "".join([self.i2c[token] for token in tokens])
 
 
 main()
